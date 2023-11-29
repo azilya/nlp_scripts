@@ -1,0 +1,44 @@
+[tool.poetry]
+name = "distillation"
+version = "0.1.0"
+description = ""
+authors = ["I.A. <azerkovich@apsolutions.ru>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+datasets = "^2.15.0"
+mlflow = "^2.8.1"
+torch = "^2.0"
+transformers = "^4.35.2"
+accelerate = "^0.24.1"
+tqdm = "^4.66.1"
+python-dotenv = "^1.0.0"
+
+[tool.poetry.group.dev.dependencies]
+flake8 = "^6.1.0"
+isort = "^5.12.0"
+black = "^23.11.0"
+flake8-bandit = "^4.1.1"
+flake8-use-fstring = "^1.4"
+flake8-bugbear = "^23.11.28"
+flake8-pyproject = "^1.2.3"
+flake8-isort = "^6.1.1"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.flake8]
+extend-ignore = "E501,W503,E203"
+extend-select = "B950,W504"
+max-line-length = 80
+exclude = [
+    # No need to traverse our git directory
+    ".git",
+    # There's no value in checking cache directories
+    "__pycache__",
+]
+
+[tool.isort]
+profile = "black"
