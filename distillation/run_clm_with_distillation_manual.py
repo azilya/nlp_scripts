@@ -31,6 +31,7 @@ import dotenv
 import mlflow
 import torch
 from torch import nn
+from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import (
@@ -45,7 +46,7 @@ from transformers import (
 )
 from transformers.utils import logging
 
-from utils import check_if_save, load_examples, parse_args
+from utils import checkpoint, load_examples, parse_args
 
 logger = logging.get_logger(__name__)
 
@@ -63,6 +64,27 @@ def train_eval_loop(
     scheduler,
     teacher=None,
 ):
+    """
+    Train-and-evaluate function that does the bulk of the actual work:
+    - places models on GPUs,
+    - creates train loop,
+    - runs eval loop.
+
+    :param args: script launch arguments
+    :type args: argparse.Namespace
+    :param train_dataloader: dataloader for the train dataset
+    :type train_dataloader: DataLoader
+    :param eval_dataloader: dataloader for the eval dataset
+    :type eval_dataloader: DataLoader
+    :param model: model to train
+    :type model: nn.Module
+    :param optimizer: optimizer created for the loop
+    :type optimizer: torch.optim.Optimizer
+    :param scheduler: scheduler created for the loop
+    :type scheduler: _type_
+    :param teacher: teacher model, defaults to None
+    :type teacher: _type_, optional
+    """
     # Train!
     total_batch_size = (
         args.per_device_train_batch_size * args.gradient_accumulation_steps
@@ -137,13 +159,16 @@ def train_eval_loop(
             loss = outputs.loss
             # Distillation loss
             loss_teach = distil_loss_fct(
-                torch.log_softmax(outputs.logits.cpu() / args.temperature, dim=-1),
-                torch.softmax(teacher_outputs.logits.cpu() / args.temperature, dim=-1),
+                torch.log_softmax(outputs.logits / args.temperature, dim=-1),
+                torch.softmax(
+                    teacher_outputs.logits.to(model.device) / args.temperature, dim=-1
+                ),
             ) * (args.temperature**2)
             loss = args.alpha_kl * loss_teach + args.alpha_ce * loss
 
-            losses.append(loss.detach().cpu())
-        losses = torch.cat(losses)
+            losses.append(loss.detach())
+            del model_batch, teach_batch, outputs, teacher_outputs
+        losses = torch.tensor(losses)
         try:
             eval_loss = torch.mean(losses)
             perplexity = math.exp(eval_loss)
@@ -184,55 +209,90 @@ def train_eval_loop(
                 next(train_dataloader._get_iterator())
         active_dataloader = train_dataloader
 
-        for batch in active_dataloader:
-            model_batch = {k: v.to(model.device) for k, v in batch.items()}
-            teach_batch = {k: v.to(teacher.device) for k, v in batch.items()}
-            # Distillation loss; arXiv:1503.02531
-            with torch.no_grad():
-                teacher_outputs = teacher(**teach_batch)
-            with torch.autocast(device_type="cuda"):
-                outputs = model(**model_batch)
-                assert outputs.logits.size() == teacher_outputs.logits.size()
-                teach_loss = distil_loss_fct(
-                    nn.functional.log_softmax(
-                        outputs.logits / args.temperature, dim=-1
-                    ),
-                    nn.functional.softmax(
-                        teacher_outputs.logits.to(model.device) / args.temperature,
-                        dim=-1,
-                    ),
-                ) * (args.temperature**2)
-                loss = args.alpha_kl * teach_loss + args.alpha_ce * outputs.loss
-            total_loss += loss.detach().cpu().float()
+        def trace_handler(p):
+            output = p.key_averages().table(
+                sort_by="self_cpu_time_total", row_limit=100
+            )
+            with open("table" + str(p.step_num) + ".txt", "w") as f:
+                f.write(output)
+            p.export_chrome_trace("trace_" + str(p.step_num) + ".json")
 
-            loss.backward()
-            # nn.utils.clip_grad_norm_(model.parameters(), max_norm=2)
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad()
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            schedule=torch.profiler.schedule(wait=30, warmup=10, active=10, repeat=2),
+            on_trace_ready=trace_handler,
+        ) as p:
+            with record_function("model_training"):
+                for batch in active_dataloader:
+                    model_batch = {k: v.to(model.device) for k, v in batch.items()}
+                    teach_batch = {k: v.to(teacher.device) for k, v in batch.items()}
+                    # Distillation loss; arXiv:1503.02531
+                    with torch.no_grad():
+                        teacher_outputs = teacher(**teach_batch)
+                    with torch.autocast(device_type="cuda"):
+                        outputs = model(**model_batch)
+                        assert outputs.logits.size() == teacher_outputs.logits.size()
+                        teach_loss = distil_loss_fct(
+                            nn.functional.log_softmax(
+                                outputs.logits / args.temperature, dim=-1
+                            ),
+                            nn.functional.softmax(
+                                teacher_outputs.logits.to(model.device)
+                                / args.temperature,
+                                dim=-1,
+                            ),
+                        ) * (args.temperature**2)
+                        loss = args.alpha_kl * teach_loss + args.alpha_ce * outputs.loss
+                    total_loss += loss.detach().float()
 
-            completed_steps += 1
-            progress_bar.update()
+                    loss.backward()
+                    # nn.utils.clip_grad_norm_(model.parameters(), max_norm=2)
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
 
-            if isinstance(args.checkpointing_steps, int):
-                if (
-                    completed_steps > 0
-                    and completed_steps % args.checkpointing_steps == 0
-                ):
-                    evaluate()
-                    check_if_save(
-                        args, model, optimizer, output_dir=f"step_{completed_steps}"
-                    )
-            if completed_steps >= args.max_train_steps:
-                break
+                    p.step()
 
-        if args.checkpointing_steps == "epoch":
-            evaluate()
-            check_if_save(args, model, optimizer, output_dir=f"epoch_{epoch}")
+                    completed_steps += 1
+                    progress_bar.update()
+
+                    if isinstance(args.checkpointing_steps, int):
+                        if (
+                            completed_steps > 0
+                            and completed_steps % args.checkpointing_steps == 0
+                        ):
+                            evaluate()
+                            checkpoint(
+                                args,
+                                model,
+                                optimizer,
+                                scheduler,
+                                output_dir=f"step_{completed_steps}",
+                            )
+                    if completed_steps >= args.max_train_steps:
+                        break
+
+                    if args.checkpointing_steps == "epoch":
+                        evaluate()
+                        checkpoint(
+                            args,
+                            model,
+                            optimizer,
+                            scheduler,
+                            output_dir=f"epoch_{epoch}",
+                        )
 
 
-def reduce_layers(model):
-    keep_layers = list(range(1, model.config.num_hidden_layers, 6))
+def reduce_layers(model, reduce_parameter=6):
+    """
+    Reducing layer number in the trained model
+
+    :param model: the input model to train later
+    :type model: _type_
+    :param reduce_parameter: degree to which the layers are reduced, defaults to 6
+    :type reduce_parameter: int, optional
+    """
+    keep_layers = list(range(1, model.config.num_hidden_layers, reduce_parameter))
     # try to take at least a part of different architectures into account
     if "decoder" in {m for m, _ in model.model.named_children()}:
         new_layers = nn.ModuleList(
@@ -252,6 +312,16 @@ def reduce_layers(model):
 
 
 def main(args: argparse.Namespace):
+    """
+    Main function to init models, start logging and training and output the results
+
+    Args:
+        args (argparse.Namespace): script launch parameters
+
+    Raises:
+        ValueError: if no existing tokenizer is given in parameters,
+        an error is raised
+    """
     datasets.utils.logging.set_verbosity_warning()
     logging.set_verbosity_info()
 

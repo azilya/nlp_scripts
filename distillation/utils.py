@@ -14,6 +14,13 @@ MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 
 
 def parse_args() -> argparse.Namespace:
+    """
+    Function to parse all arguments given to scripts on launch
+    and run some sanity checks on them.
+
+    :return: namespace with all given arguments and their values
+    :rtype: argparse.Namespace
+    """
     parser = argparse.ArgumentParser(
         description=(
             "Finetune and distillate a transformers model"
@@ -284,7 +291,18 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def check_if_save(args, model, optimizer, output_dir):
+def checkpoint(args, model, optimizer, scheduler, output_dir):
+    """
+    Function to create a checkpoint of the trained model and training environment
+    at a given time. If a maximum is given, older checkpoints are pruned.
+
+    :param args: training arguments
+    :param model: model to be saved
+    :param optimizer: optimizer to be saved
+    :param scheduler: sscheduler to be saved
+    :param output_dir: folder name to place checkpoint in
+        (is created inside the args.output_dir folder)
+    """
     if args.output_dir is not None:
         dirs = [
             os.path.join(args.output_dir, f.name)
@@ -298,11 +316,25 @@ def check_if_save(args, model, optimizer, output_dir):
             for i in range(chckp_diff):
                 os.rmdir(dirs[i])
         output_dir = os.path.join(args.output_dir, output_dir)
-        torch.save(model.state_dict(), output_dir + "/state_dict.bin")
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        torch.save(model, output_dir + "/pytorch_model.bin")
         torch.save(optimizer, output_dir + "/optimizer.bin")
+        torch.save(scheduler, output_dir + "/scheduler.bin")
 
 
-def load_examples(args, tokenizer, logger):
+def load_examples(args, tokenizer, logger) -> tuple:
+    """
+    Function to load the training and test datasets and preprocess them
+    properly as inputs to the model.
+    Returns two datasets: train and test
+
+    :param args: script launch arguments
+    :param tokenizer: tokenizer from the launch parameters
+    :param logger: logger from launch parameters
+    :return: train dataset, test dataset
+    :rtype: tuple
+    """
     if args.dataset_name is not None:
         raw_datasets = load_dataset(args.dataset_name, args.dataset_config_name)
         if "validation" not in raw_datasets.keys():

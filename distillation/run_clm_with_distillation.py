@@ -47,7 +47,7 @@ from transformers import (
     get_scheduler,
 )
 
-from utils import check_if_save, load_examples, parse_args
+from utils import checkpoint, load_examples, parse_args
 
 logger = get_logger(__name__)
 
@@ -66,6 +66,29 @@ def train_eval_loop(
     scheduler,
     teacher=None,
 ):
+    """
+    Train-and-evaluate function that does the bulk of the actual work:
+    - places models on GPUs,
+    - creates train loop,
+    - runs eval loop.
+
+    :param args: script launch arguments
+    :type args: argparse.Namespace
+    :param train_dataloader: dataloader for the train dataset
+    :type train_dataloader: DataLoader
+    :param eval_dataloader: dataloader for the eval dataset
+    :type eval_dataloader: DataLoader
+    :param accelerator: accelerator created for the loop
+    :type accelerator: Accelerator
+    :param model: model to train
+    :type model: nn.Module
+    :param optimizer: optimizer created for the loop
+    :type optimizer: torch.optim.Optimizer
+    :param scheduler: scheduler created for the loop
+    :type scheduler: _type_
+    :param teacher: teacher model, defaults to None
+    :type teacher: _type_, optional
+    """
     # Train!
     total_batch_size = (
         args.per_device_train_batch_size
@@ -222,17 +245,31 @@ def train_eval_loop(
                     and completed_steps % args.checkpointing_steps == 0
                 ):
                     evaluate()
-                    check_if_save(output_dir=f"step_{completed_steps}")
+                    checkpoint(
+                        args,
+                        model,
+                        optimizer,
+                        scheduler,
+                        output_dir=f"step_{completed_steps}",
+                    )
             if completed_steps >= args.max_train_steps:
                 break
 
         if args.checkpointing_steps == "epoch":
             evaluate()
-            check_if_save(output_dir=f"epoch_{epoch}")
+            checkpoint(args, model, optimizer, scheduler, output_dir=f"epoch_{epoch}")
 
 
-def reduce_layers(model):
-    keep_layers = list(range(1, model.config.num_hidden_layers, 10))
+def reduce_layers(model, reduce_parameter=6):
+    """
+    Reducing layer number in the trained model
+
+    :param model: the input model to train later
+    :type model: _type_
+    :param reduce_parameter: degree to which the layers are reduced, defaults to 6
+    :type reduce_parameter: int, optional
+    """
+    keep_layers = list(range(1, model.config.num_hidden_layers, reduce_parameter))
     # try to take at least a part of different architectures into account
     if "decoder" in {m for m, _ in model.model.named_children()}:
         new_layers = nn.ModuleList(
@@ -252,6 +289,16 @@ def reduce_layers(model):
 
 
 def main(args: argparse.Namespace):
+    """
+    Main function to init models, start logging and training and output the results
+
+    Args:
+        args (argparse.Namespace): script launch parameters
+
+    Raises:
+        ValueError: if no existing tokenizer is given in parameters,
+        an error is raised
+    """
     acc_config = ProjectConfiguration(total_limit=args.checkpoint_limit)
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
